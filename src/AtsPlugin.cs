@@ -65,10 +65,18 @@ namespace AtsPluginNs
         // ----- プラグイン基本情報 -----
 
         [DllExport("Load", CallingConvention = CallingConvention.StdCall)]
-        public static void Load()
-        {
-            HttpServer.Start(8080);
-        }
+public static void Load()
+{
+    try
+    {
+        System.IO.File.WriteAllText(@"C:\Temp\ats_plugin_log.txt", "Load() called at " + DateTime.Now.ToString());
+    }
+    catch (Exception)
+    {
+    }
+
+    HttpServer.Start(8080);
+}
 
         [DllExport("Dispose", CallingConvention = CallingConvention.StdCall)]
         public static void Dispose()
