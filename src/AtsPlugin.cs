@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using RGiesecke.DllExport;
 
 namespace AtsPluginNs
@@ -50,50 +51,60 @@ namespace AtsPluginNs
             public IntPtr ConstantSpeed;
         }
 
+        // ----- プラグイン内部状態 -----
+
+        // 仕業カードCSVが入っているフォルダ。実際の配置に合わせて後で調整する。
+        private static readonly string IcCardFolder = @"Plugin\IC\Niihama";
+
+        private static TimsDataLoader timsData = new TimsDataLoader();
+        private static int currentTrainNumber = -1;       // $ICCardNumberの生値
+        private static int currentStationNumber = -1;      // 地上子1001の値
+        private static float currentSpeed = 0;
+        private static int currentTimeMs = 0;
+
         // ----- プラグイン基本情報 -----
 
         [DllExport("Load", CallingConvention = CallingConvention.StdCall)]
         public static void Load()
         {
-            // プラグインがBVEに読み込まれた時に呼ばれる
-            // 今後ここでWebSocketサーバーを起動する予定
+            HttpServer.Start(8080);
         }
 
         [DllExport("Dispose", CallingConvention = CallingConvention.StdCall)]
         public static void Dispose()
         {
-            // プラグインがBVEから解放される時に呼ばれる
-            // 今後ここでWebSocketサーバーを停止する予定
-            // クラッシュ防止のため、必ず実装すること
+            HttpServer.Stop();
         }
 
         [DllExport("GetPluginVersion", CallingConvention = CallingConvention.StdCall)]
         public static int GetPluginVersion()
         {
-            return 131072; // バージョン情報。固定値でOK
+            return 131072;
         }
 
         [DllExport("SetVehicleSpec", CallingConvention = CallingConvention.StdCall)]
         public static void SetVehicleSpec(ATS_VEHICLESPEC spec)
         {
-            // 車両データ読み込み時に呼ばれる
         }
 
         [DllExport("Initialize", CallingConvention = CallingConvention.StdCall)]
         public static void Initialize(int brake)
         {
-            // シナリオ開始・始発駅復帰時に呼ばれる
-            // 今後ここで列車番号・行路情報などの設定ファイルを読み込む予定
+            // シナリオ開始時。まだ列車番号が来ていないのでCSVはここでは読まない。
+            currentTrainNumber = -1;
+            currentStationNumber = -1;
         }
 
         [DllExport("Elapse", CallingConvention = CallingConvention.StdCall)]
         public static ATS_HANDLES Elapse(ATS_VEHICLESTATE state, IntPtr panel, IntPtr sound)
         {
-            // 毎フレーム呼ばれる。速度・時刻などはここで取得できる
-            // 今後ここでWebSocketへ送信する予定
+            currentSpeed = state.Speed;
+            currentTimeMs = state.Time;
+
+            PublishJson();
 
             ATS_HANDLES handles = new ATS_HANDLES();
-            handles.Brake = -1;       // -1は「変更なし」を意味する
+            handles.Brake = -1;
             handles.Power = -1;
             handles.Reverser = -1;
             handles.ConstantSpeed = IntPtr.Zero;
@@ -121,13 +132,11 @@ namespace AtsPluginNs
         [DllExport("DoorOpen", CallingConvention = CallingConvention.StdCall)]
         public static void DoorOpen()
         {
-            // ドアが開いた時に呼ばれる
         }
 
         [DllExport("DoorClose", CallingConvention = CallingConvention.StdCall)]
         public static void DoorClose()
         {
-            // ドアが閉まった時に呼ばれる
         }
 
         [DllExport("SetSignal", CallingConvention = CallingConvention.StdCall)]
@@ -136,7 +145,71 @@ namespace AtsPluginNs
         [DllExport("SetBeaconData", CallingConvention = CallingConvention.StdCall)]
         public static void SetBeaconData(ATS_BEACONDATA beacon)
         {
-            // 地上子を踏んだ時に呼ばれる
+            try
+            {
+                if (beacon.Type == 1000)
+                {
+                    // 列車番号(IC番号)を受信 -> 対応するCSVを読み込む
+                    currentTrainNumber = beacon.Optional;
+                    LoadCsvForTrainNumber(currentTrainNumber);
+                }
+                else if (beacon.Type == 1001)
+                {
+                    // 駅番号を受信
+                    currentStationNumber = beacon.Optional;
+                }
+            }
+            catch (Exception)
+            {
+                // 地上子処理の失敗でBVE本体を落とさない
+            }
+        }
+
+        private static void LoadCsvForTrainNumber(int icCardNumber)
+        {
+            string fileName = TimsDataLoader.BuildCsvFileName(icCardNumber);
+            if (fileName == null) return;
+
+            string fullPath = System.IO.Path.Combine(IcCardFolder, fileName);
+            timsData.Load(fullPath);
+        }
+
+        // ----- JSON生成・送信 -----
+
+        private static void PublishJson()
+        {
+            try
+            {
+                string trainNumberStr = timsData.TrainNumber ?? "----";
+
+                TimsStationData currentStation = timsData.GetStationByNumber(currentStationNumber);
+                string stationName = currentStation != null ? currentStation.StationName : "";
+                int arrivalTime = currentStation != null ? currentStation.ArrivalTime : -1;
+                int departureTime = currentStation != null ? currentStation.DepartureTime : -1;
+
+                StringBuilder sb = new StringBuilder();
+                sb.Append("{");
+                sb.Append("\"trainNumber\":\"").Append(JsonEscape(trainNumberStr)).Append("\",");
+                sb.Append("\"speed\":").Append(currentSpeed.ToString("F1")).Append(",");
+                sb.Append("\"timeMs\":").Append(currentTimeMs).Append(",");
+                sb.Append("\"stationNumber\":").Append(currentStationNumber).Append(",");
+                sb.Append("\"stationName\":\"").Append(JsonEscape(stationName)).Append("\",");
+                sb.Append("\"arrivalTime\":").Append(arrivalTime).Append(",");
+                sb.Append("\"departureTime\":").Append(departureTime);
+                sb.Append("}");
+
+                HttpServer.UpdateData(sb.ToString());
+            }
+            catch (Exception)
+            {
+                // JSON生成失敗時もBVE本体を落とさない
+            }
+        }
+
+        private static string JsonEscape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
         }
     }
 }
